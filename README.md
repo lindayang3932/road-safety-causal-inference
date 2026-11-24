@@ -4,14 +4,7 @@ Research collaboration with Professor Cathy Xia, The Ohio State University.
 
 This repository documents my statistical analyses of a geographically assigned road-safety advertising intervention, focusing on model assumptions, rare-event outcomes, geographic spillover, and sensitivity of treatment-effect estimates.
 
-## Research components
-
-| Component | Report | Analysis |
-|---|---|---|
-| Parallel trends, mixed-effects DiD, and driving behavior | [LaTeX](reports/did_mixed_effects.tex) | [Python notebook](code/street_vision_analysis.ipynb) |
-| Fatal crash counts and model diagnostics | [LaTeX](reports/fatal_crash_models.tex) | [R Markdown](code/fatal_crash_models.Rmd), [Python notebook](code/crash_analysis.ipynb) |
-| Geographic spillover | [LaTeX](reports/geographic_spillover.tex) | [Python notebook](code/crash_analysis.ipynb) |
-| Treatment-window and group/county sensitivity | [LaTeX](reports/did_mixed_effects.tex) | [Python notebook](code/crash_analysis.ipynb) |
+This research evaluates a cluster-randomized road-safety advertising campaign conducted in Ohio. Groups of counties were assigned to one of three experimental arms: a campaign targeting nighttime driving, a campaign targeting speeding, or a control group. The objective was to assess whether these interventions influenced driving behavior, including speeding, phone use and hard braking, as well as crash outcomes.
 
 ## My contributions
 
