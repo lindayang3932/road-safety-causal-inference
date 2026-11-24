@@ -1,0 +1,1027 @@
+---
+title: "Fatal Crash Counts: Poisson Model Assessment"
+subtitle: "Analysis summary for research discussion"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+---
+
+## Research question and main takeaway
+
+**Question.** Is a standard Poisson regression an adequate working model for weekly fatal crash counts, or do the data require additional dispersion, a separate zero-generating process, or random intercepts?
+
+**Preliminary conclusion.** For the current set of predictors, Poisson is the most parsimonious of the fitted candidates. Zero-inflated Poisson, negative binomial, and random-intercept Poisson models did not improve AIC. DHARMa diagnostics did not flag a significant overall dispersion or zero-inflation problem. **We should not claim perfect fit:** the Pearson statistic indicates some residual discrepancy, including under a simulation-based calibration. We investigate that discrepancy rather than discarding it.
+
+> Model adequacy for crash counts is distinct from valid treatment-effect inference. The cluster-randomized design, repeated county observations, possible spillover, and any treatment-assignment restrictions must still inform the inferential strategy.
+
+## 1. Data and baseline Poisson model
+
+The outcome is weekly fatal crash count by county. We model the expected count with a log link and `log(Population)` as an offset. The main terms of interest are the intervention-arm-by-post-period interactions; the control arm is the reference. The post period is coded here as `Week_Rel >= 2`.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 7, fig.height = 4.5)
+
+library(DHARMa)
+library(MASS)
+library(pscl)
+library(lme4)
+library(sandwich)
+library(lmtest)
+```
+
+```{r baseline-model}
+# Place this .Rmd file in the same folder as data.csv before knitting.
+data <- read.csv("data.csv", check.names = FALSE)
+fatal_data <- subset(data, Severity == "Fatal")
+
+fatal_data$Arm <- factor(fatal_data$Arm,
+                         levels = c("Control", "Nighttime", "Speeding"))
+fatal_data$Post <- factor(as.integer(fatal_data$Week_Rel >= 2),
+                          levels = c(0, 1))
+fatal_data$County <- factor(fatal_data$County)
+
+model_vars <- c("Crashes", "Arm", "Post", "County", "Population",
+                "Week_Rel", "log_temp_f", "log_pct_age_18_24",
+                "log_pct_age_65_plus", "log_precipitation_mm",
+                "log_wind_speed_kph", "Storm_Week_x")
+
+# Explicitly use the same rows for every model comparison.
+model_data <- fatal_data[complete.cases(fatal_data[, model_vars]), ]
+stopifnot(all(model_data$Population > 0))
+
+count_formula <- Crashes ~ Arm * Post + log_temp_f +
+  log_pct_age_18_24 + log_pct_age_65_plus +
+  log_precipitation_mm + log_wind_speed_kph + Storm_Week_x
+
+glm.1 <- glm(count_formula, family = poisson(link = "log"),
+             offset = log(Population), data = model_data)
+
+c(observations = nobs(glm.1), counties = nlevels(droplevels(model_data$County)))
+summary(glm.1)
+```
+```{r}
+
+par(mfrow=c(2,2))
+plot(glm.1)
+par(mfrow = c(1, 1))
+
+crash_colors <- as.numeric(factor(model_data$Crashes))
+
+plot(glm.1, which = 1, col = crash_colors, pch = 19)
+
+legend("topright",
+       legend = levels(factor(model_data$Crashes)),
+       col = seq_along(levels(factor(model_data$Crashes))),
+       pch = 19,
+       title = "Crash Count")
+```
+
+```{r}
+table(model_data$Crashes)
+```
+
+we can expect to see a line in which the residuals do not go below because the data itself
+```{r}
+covariates <- c(
+  "log_temp_f",
+  "log_pct_age_18_24",
+  "log_pct_age_65_plus",
+  "log_precipitation_mm",
+  "log_wind_speed_kph"
+)
+
+
+
+for (v in covariates) {
+  binnedplot(
+    x = model_data[[v]],
+    y = residuals(glm.1, type = "pearson"),
+    xlab = v,
+    ylab = "Average Pearson Residual",
+    main = v
+  )
+}
+
+par(mfrow = c(1, 1))
+```
+```{r}
+library(dplyr)
+
+clean_county <- function(x) {
+  trimws(gsub(" county$", "", tolower(trimws(x))))
+}
+
+ohio_classification <- nchs %>%
+  filter(State == "OH") %>%
+  transmute(
+    County_key = clean_county(County_name),
+    NCHS_Code = as.integer(substr(X2023.Code, 1, 1)),
+    Urban_Rural = case_when(
+      NCHS_Code %in% 1:4 ~ "Urban",
+      NCHS_Code %in% 5:6 ~ "Rural"
+    )
+  )
+
+head(ohio_classification)
+table(ohio_classification$Urban_Rural, useNA = "ifany")
+nrow(ohio_classification)
+urban_rural_data <- model_data %>%
+  mutate(
+    County_key = clean_county(County),
+    Pearson_sq = residuals(glm.1, type = "pearson")^2,
+    Expected_Crashes = fitted(glm.1)
+  ) %>%
+  left_join(ohio_classification, by = "County_key")
+
+# Check unmatched counties
+unique(urban_rural_data$County[
+  is.na(urban_rural_data$Urban_Rural)
+])
+
+# Verify that no additional rows were created
+stopifnot(nrow(urban_rural_data) == nrow(model_data))
+
+# Count unique counties by classification
+urban_rural_data %>%
+  distinct(County, Urban_Rural) %>%
+  count(Urban_Rural)
+```
+```{r}
+rural_data <- subset(urban_rural_data, Urban_Rural == "Rural")
+urban_data <- subset(urban_rural_data, Urban_Rural == "Urban")
+
+glm.rural <- glm(
+  count_formula,
+  family = poisson,
+  offset = log(Population),
+  data = rural_data
+)
+
+glm.urban <- glm(
+  count_formula,
+  family = poisson,
+  offset = log(Population),
+  data = urban_data
+)
+par(mfrow = c(2, 2))
+plot(glm.rural)
+
+par(mfrow = c(2, 2))
+plot(glm.urban)
+```
+
+```{r}
+summary(glm.urban)
+summary(glm.rural)
+summary(glm.cluster1)
+
+```
+
+
+```{r}
+dispersion_test <- function(model) {
+
+  X2 <- sum(residuals(model, type = "pearson")^2)
+  df <- df.residual(model)
+
+  c(
+    Pearson_Chi_Square = X2,
+    DF = df,
+    Dispersion = X2 / df,
+    P_Value = pchisq(X2, df, lower.tail = FALSE)
+  )
+}
+
+rbind(
+  Rural = dispersion_test(glm.rural),
+  Urban = dispersion_test(glm.urban)
+)
+library(DHARMa)
+
+sim.rural <- simulateResiduals(glm.rural, n = 1000)
+sim.urban <- simulateResiduals(glm.urban, n = 1000)
+
+plot(sim.rural)
+plot(sim.urban)
+
+# Rural
+testDispersion(sim.rural)
+testZeroInflation(sim.rural)
+
+# Urban
+testDispersion(sim.urban)
+testZeroInflation(sim.urban)
+```
+```{r}
+glm.heterogeneity <- glm(
+  Crashes ~ Arm * Post * Urban_Rural +
+    log_temp_f +
+    log_pct_age_18_24 +
+    log_pct_age_65_plus +
+    log_precipitation_mm +
+    log_wind_speed_kph +
+    Storm_Week_x,
+  family = poisson,
+  offset = log(Population),
+  data = urban_rural_data
+)
+
+summary(glm.heterogeneity)
+```
+```{r}
+quasi.heterogeneity <- update(
+  glm.heterogeneity,
+  family = quasipoisson
+)
+
+summary(quasi.heterogeneity)
+plot(quasi.heterogeneity)
+```
+```{r}
+library(readxl)
+library(dplyr)
+library(tidyr)
+
+alltime <- read_excel(
+  "alltime_combined_traffic_data (2).xlsx"
+)
+
+nighttime <- read_excel(
+  "nighttime_combined_traffic_data (2).xlsx",
+  sheet = "All Data"
+)
+prepare_traffic <- function(df, prefix) {
+
+  df %>%
+    filter(Week_Rel < 0) %>%
+    mutate(County_key = clean_county(County)) %>%
+    group_by(County_key, Metric) %>%
+    summarise(
+      Mean_Value = mean(Value, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    pivot_wider(
+      names_from = Metric,
+      values_from = Mean_Value,
+      names_prefix = prefix
+    )
+}
+
+alltime_features <- prepare_traffic(alltime, "alltime_")
+nighttime_features <- prepare_traffic(nighttime, "nighttime_")
+```
+```{r}
+county_features <- urban_rural_data %>%
+  group_by(County_key, Urban_Rural) %>%
+  summarise(
+    log_Population = mean(log(Population)),
+    log_pct_age_18_24 = mean(log_pct_age_18_24),
+    log_pct_age_65_plus = mean(log_pct_age_65_plus),
+    .groups = "drop"
+  ) %>%
+  left_join(alltime_features, by = "County_key") %>%
+  left_join(nighttime_features, by = "County_key")
+dim(county_features)
+
+names(county_features)
+
+colSums(is.na(county_features))
+
+head(county_features)
+```
+```{r}
+pca_data <- county_features %>%
+  dplyr::select(
+    -County_key,
+    -Urban_Rural,
+    -`alltime_Handheld Phone Calls`
+  )
+
+dim(pca_data)
+names(pca_data)
+
+# Check for missing or non-finite values
+colSums(!is.finite(as.matrix(pca_data)))
+
+# Check for zero-variance variables
+sapply(pca_data, sd)
+pca_model <- prcomp(
+  pca_data,
+  center = TRUE,
+  scale. = TRUE
+)
+
+summary(pca_model)
+par(mfrow = c(1, 2))
+
+# Scree plot
+plot(pca_model, type = "l", main = "Scree Plot")
+
+# Cumulative explained variance
+prop_var <- pca_model$sdev^2 / sum(pca_model$sdev^2)
+
+plot(
+  cumsum(prop_var),
+  type = "b",
+  xlab = "Number of Principal Components",
+  ylab = "Cumulative Explained Variance",
+  main = "Cumulative Explained Variance"
+)
+
+abline(h = 0.8, col = "red", lty = 2)
+
+par(mfrow = c(1, 1))
+pca_scores <- as.data.frame(pca_model$x)
+
+plot(
+  pca_scores$PC1,
+  pca_scores$PC2,
+  pch = 19,
+  xlab = "PC1",
+  ylab = "PC2",
+  main = "County-Level PCA"
+)
+pca_scores$Urban_Rural <- county_features$Urban_Rural
+pca_scores$County <- county_features$County_key
+
+colors <- ifelse(
+  pca_scores$Urban_Rural == "Rural",
+  "steelblue",
+  "tomato"
+)
+
+plot(
+  pca_scores$PC1,
+  pca_scores$PC2,
+  col = colors,
+  pch = 19,
+  xlab = "PC1",
+  ylab = "PC2",
+  main = "PCA by Urban-Rural Classification"
+)
+
+legend(
+  "topright",
+  legend = c("Rural", "Urban"),
+  col = c("steelblue", "tomato"),
+  pch = 19
+)
+```
+```{r}
+cluster1_data <- subset(cluster_model_data, Cluster == 1)
+cluster2_data <- subset(cluster_model_data, Cluster == 2)
+cluster3_data <- subset(cluster_model_data, Cluster == 3)
+
+glm.c1 <- glm(
+  count_formula,
+  family = poisson,
+  offset = log(Population),
+  data = cluster1_data
+)
+
+glm.c2 <- glm(
+  count_formula,
+  family = poisson,
+  offset = log(Population),
+  data = cluster2_data
+)
+
+glm.c3 <- glm(
+  count_formula,
+  family = poisson,
+  offset = log(Population),
+  data = cluster3_data
+)
+rbind(
+  Cluster1 = dispersion_test(glm.c1),
+  Cluster2 = dispersion_test(glm.c2),
+  Cluster3 = dispersion_test(glm.c3)
+)
+sim.c1 <- simulateResiduals(glm.c1, n = 1000)
+sim.c2 <- simulateResiduals(glm.c2, n = 1000)
+sim.c3 <- simulateResiduals(glm.c3, n = 1000)
+
+plot(sim.c1)
+plot(sim.c2)
+plot(sim.c3)
+
+# Cluster 1
+testDispersion(sim.c1)
+testZeroInflation(sim.c1)
+
+# Cluster 2
+testDispersion(sim.c2)
+testZeroInflation(sim.c2)
+
+# Cluster 3
+testDispersion(sim.c3)
+testZeroInflation(sim.c3)
+xtabs(
+  Crashes ~ Cluster + Arm + Post,
+  data = cluster_model_data
+)
+```
+```{r}
+glm.cluster <- update(
+  glm.1,
+  . ~ . + Cluster,
+  data = cluster_model_data
+)
+
+data.frame(
+  Model = c(
+    "Original Poisson",
+    "Separate Urban-Rural",
+    "Poisson + Cluster",
+    "Separate PCA Clusters"
+  ),
+  Parameters = c(
+    length(coef(glm.1)),
+    length(coef(glm.rural)) +
+      length(coef(glm.urban)),
+    length(coef(glm.cluster)),
+    length(coef(glm.c1)) +
+      length(coef(glm.c2)) +
+      length(coef(glm.c3))
+  ),
+  AIC = c(
+    AIC(glm.1),
+    AIC(glm.rural) + AIC(glm.urban),
+    AIC(glm.cluster),
+    AIC(glm.c1) + AIC(glm.c2) + AIC(glm.c3)
+  )
+)
+```
+```{r}
+
+summary(glm.urban)
+summary(glm.rural)
+summary(glm.1)
+```
+
+```{r}
+summary(glm.cluster)
+
+rbind(
+  Original = dispersion_test(glm.1),
+  With_Cluster = dispersion_test(glm.cluster)
+)
+sim.cluster <- simulateResiduals(
+  glm.cluster,
+  n = 1000
+)
+
+plot(sim.cluster)
+
+testDispersion(sim.cluster)
+testZeroInflation(sim.cluster)
+terms <- c(
+  "ArmNighttime:Post1",
+  "ArmSpeeding:Post1"
+)
+
+list(
+  Original = coef(summary(glm.1))[terms, ],
+  With_Cluster = coef(summary(glm.cluster))[terms, ]
+)
+plot(glm.cluster)
+```
+
+
+```{r}
+glm.cluster.heterogeneity <- glm(
+  Crashes ~ Arm * Post * Cluster +
+    log_temp_f +
+    log_pct_age_18_24 +
+    log_pct_age_65_plus +
+    log_precipitation_mm +
+    log_wind_speed_kph +
+    Storm_Week_x,
+  family = poisson,
+  offset = log(Population),
+  data = cluster_model_data
+)
+
+summary(glm.cluster.heterogeneity)
+glm.cluster.no_heterogeneity <- update(
+  glm.cluster.heterogeneity,
+  . ~ . - Arm:Post:Cluster
+)
+
+anova(
+  glm.cluster.no_heterogeneity,
+  glm.cluster.heterogeneity,
+  test = "Chisq"
+)
+AIC(
+  glm.1,
+  glm.cluster,
+  glm.cluster.no_heterogeneity,
+  glm.cluster.heterogeneity
+)
+```
+```{r}
+county_pcs <- data.frame(
+  County_key = county_features$County_key,
+  pca_model$x[, 1:4]
+)
+
+pca_model_data <- cluster_model_data %>%
+  left_join(county_pcs, by = "County_key")
+
+stopifnot(
+  nrow(pca_model_data) == nrow(model_data),
+  !anyNA(pca_model_data[, paste0("PC", 1:4)])
+)
+glm.pc1 <- update(
+  glm.1, . ~ . + PC1,
+  data = pca_model_data
+)
+
+glm.pc2 <- update(
+  glm.1, . ~ . + PC1 + PC2,
+  data = pca_model_data
+)
+
+glm.pc3 <- update(
+  glm.1, . ~ . + PC1 + PC2 + PC3,
+  data = pca_model_data
+)
+
+glm.pc4 <- update(
+  glm.1, . ~ . + PC1 + PC2 + PC3 + PC4,
+  data = pca_model_data
+)
+
+summary(glm.pc4)
+models <- list(
+  "Original Poisson" = glm.1,
+  "Poisson + Cluster" = glm.cluster,
+  "Poisson + PC1" = glm.pc1,
+  "Poisson + PC1-2" = glm.pc2,
+  "Poisson + PC1-3" = glm.pc3,
+  "Poisson + PC1-4" = glm.pc4
+)
+
+for (name in names(models)) {
+
+  par(mfrow = c(2, 2))
+
+  plot(models[[name]], sub.caption = name)
+}
+
+par(mfrow = c(1, 1))
+par(mfrow = c(3, 2))
+
+for (name in names(models)) {
+
+  plot(
+    models[[name]],
+    which = 1,
+    main = name,
+    sub.caption = ""
+  )
+}
+
+par(mfrow = c(1, 1))
+library(arm)
+
+par(mfrow = c(3, 2))
+
+for (name in names(models)) {
+
+  binnedplot(
+    x = predict(models[[name]]),
+    y = residuals(models[[name]], type = "pearson"),
+    xlab = "Predicted Values",
+    ylab = "Average Pearson Residual",
+    main = name
+  )
+}
+
+par(mfrow = c(1, 1))
+rbind(
+  Original = dispersion_test(glm.1),
+  Cluster = dispersion_test(glm.cluster),
+  PC1 = dispersion_test(glm.pc1),
+  PC1_2 = dispersion_test(glm.pc2),
+  PC1_3 = dispersion_test(glm.pc3),
+  PC1_4 = dispersion_test(glm.pc4)
+)
+```
+```{r}
+hist(model_data$Crashes)
+```
+
+```{r}
+glm.pc2_only <- update(
+  glm.1,
+  . ~ . + PC2,
+  data = pca_model_data
+)
+
+summary(glm.pc2_only)
+
+AIC(
+  glm.1,
+  glm.cluster,
+  glm.pc1,
+  glm.pc2_only,
+  glm.pc2,
+  glm.pc3,
+  glm.pc4
+)
+
+rbind(
+  Original = dispersion_test(glm.1),
+  Cluster = dispersion_test(glm.cluster),
+  PC1 = dispersion_test(glm.pc1),
+  PC2_Only = dispersion_test(glm.pc2_only),
+  PC1_2 = dispersion_test(glm.pc2),
+  PC1_3 = dispersion_test(glm.pc3),
+  PC1_4 = dispersion_test(glm.pc4)
+)
+par(mfrow = c(1, 2))
+
+binnedplot(
+  x = pca_model_data$PC2,
+  y = residuals(glm.1, type = "pearson"),
+  xlab = "PC2",
+  ylab = "Average Pearson Residual",
+  main = "Original Poisson"
+)
+
+binnedplot(
+  x = pca_model_data$PC2,
+  y = residuals(glm.pc2_only, type = "pearson"),
+  xlab = "PC2",
+  ylab = "Average Pearson Residual",
+  main = "Poisson + PC2"
+)
+
+par(mfrow = c(1, 1))
+```
+```{r}
+summary(glm.pc2_only)
+```
+
+```{r}
+dispersion_test <- function(model) {
+
+  # Expected and observed counts
+  E.y. <- predict(model, type = "response")
+  y <- model.response(model.frame(model))
+
+  # Pearson residuals
+  z <- (y - E.y.) / sqrt(E.y.)
+
+  # Pearson chi-squared statistic
+  test.statistic <- sum(z^2)
+
+  n <- length(y)
+  pp1 <- length(coef(model))
+
+  # Dispersion and p-value
+  c(
+    Pearson_Chi_Square = test.statistic,
+    DF = n - pp1,
+    Dispersion = test.statistic / (n - pp1),
+    P_Value = pchisq(test.statistic,
+                     n - pp1,
+                     lower.tail = FALSE)
+  )
+}
+rbind(
+  Original = dispersion_test(glm.1),
+  Cluster = dispersion_test(glm.cluster),
+  PC1 = dispersion_test(glm.pc1),
+  PC2_Only = dispersion_test(glm.pc2_only),
+  PC1_2 = dispersion_test(glm.pc2),
+  PC1_3 = dispersion_test(glm.pc3),
+  PC1_4 = dispersion_test(glm.pc4),
+  urban = dispersion_test(glm.urban),
+  rural = dispersion_test(glm.rural)
+)
+```
+
+
+
+Rather than separating counties into discrete clusters, I investigated including the principal component scores directly as continuous covariates. Using the Pearson chi-squared statistic, I found that including PC2 alone reduced estimated dispersion from 1.24 to 1.10. It also produced the lowest AIC among the candidate models, while leaving the estimated campaign effects virtually unchanged.
+
+Although the Pearson test still suggests mild overdispersion, including PC2 appears to account for some of the previously unexplained county-level heterogeneity.
+
+## 2. Diagnostic checks and calibration
+
+DHARMa uses simulated residuals, making these diagnostics useful for sparse, discrete outcomes. Nonsignificant tests indicate *no detected problem*, not proof that the distribution is correct.
+
+```{r dharma}
+set.seed(123)
+sim_poisson <- simulateResiduals(glm.1, n = 1000)
+plot(sim_poisson)
+testDispersion(sim_poisson)
+testZeroInflation(sim_poisson)
+testUniformity(sim_poisson)
+testOutliers(sim_poisson)
+```
+
+DHARMa dispersion p = 0.604; zero-inflation p = 0.480; uniformity p = 0.376; outlier p = 1.000. The results should be checked against the updated knitted run.
+
+For count outcomes, a scatterplot of individual predicted and observed values is expected to show horizontal bands. To assess mena calibration, compare the average observed and predicted counts within bins of fitted risk.
+
+```{r calibration}
+mu <- fitted(glm.1)
+y <- model.response(model.frame(glm.1))
+
+par(mfrow = c(1, 2))
+plot(log1p(mu), log1p(y),
+     xlab = "log(1 + predicted count)",
+     ylab = "log(1 + observed count)",
+     main = "Individual outcomes", pch = 16, cex = 0.6)
+abline(0, 1, col = 'red', lwd = 2)
+
+risk_bin <- cut(rank(mu, ties.method = "first"), breaks = 10,
+                include.lowest = TRUE)
+avg_pred <- tapply(mu, risk_bin, mean)
+avg_obs <- tapply(y, risk_bin, mean)
+plot(avg_pred, avg_obs, pch = 19,
+     xlab = "Mean predicted crashes",
+     ylab = "Mean observed crashes",
+     main = "Binned mean calibration")
+abline(0, 1, col = "red", lwd = 2)
+par(mfrow = c(1, 1))
+```
+
+## 3. Why is the Pearson overdispersion statistic significant?
+
+The conventional Pearson statistic is
+
+$$X^2 = \sum_i \frac{(y_i-\hat\mu_i)^2}{\hat\mu_i}, \qquad
+\hat\phi = \frac{X^2}{n-p}. $$
+
+Its chi-square reference distribution is an approximation and can perform poorly when many fitted means are extremely small. The discrepancy is nonetheless worth investigating: an inaccurate reference distribution is not the same thing as no residual lack of fit.
+
+```{r pearson-summary}
+pearson_contrib <- (y - mu)^2 / mu
+pearson_stat <- sum(pearson_contrib)
+pearson_df <- df.residual(glm.1)
+pearson_summary <- data.frame(
+  Pearson_Chi_square = pearson_stat,
+  Residual_DF = pearson_df,
+  Dispersion_Ratio = pearson_stat / pearson_df,
+  Approx_Chi_square_P = pchisq(pearson_stat, pearson_df,
+                             lower.tail = FALSE)
+)
+knitr::kable(pearson_summary, digits = 6)
+```
+
+
+### 3.1 Which observations contribute most?
+
+The Pearson test indicates modest overdispersion, but further investigation showed that a substantial portion of the statistic is driven by a small number of observations with very low predicted crash counts. DHARMa does not detect significant overdispersion. Additionally, negative binomial regression offers no improvement over Poisson. Taken together, these results support retaining Poisson as our working model, while acknowledging the Pearson diagnostic.
+
+
+
+```{r pearson-contributions}
+top_idx <- head(order(pearson_contrib, decreasing = TRUE), 10)
+top_pearson <- data.frame(
+  County = model_data$County[top_idx],
+  Week_Rel = model_data$Week_Rel[top_idx],
+  Population = model_data$Population[top_idx],
+  Observed = y[top_idx],
+  Predicted = mu[top_idx],
+  Pearson_Contribution = pearson_contrib[top_idx]
+)
+knitr::kable(top_pearson, digits = 4)
+cat("Top 10 share of total Pearson chi-square:",
+    round(100 * sum(pearson_contrib[top_idx]) / pearson_stat, 1), "%\n")
+
+
+
+
+
+```
+
+**Earlier finding:** the largest 10 of 968 observations account for about 33.3% of the Pearson statistic. Many are from small counties. This documents the statistic's sensitivity to low predicted counts, but does not, on its own, prove the Poisson model is correct.
+
+### 3.2 Do low-risk observations have systematically too many crashes?
+
+```{r low-risk-check}
+low_risk <- mu < 0.05
+low_risk_summary <- data.frame(
+  N = sum(low_risk),
+  Observed_Crashes = sum(y[low_risk]),
+  Expected_Crashes = sum(mu[low_risk])
+)
+knitr::kable(low_risk_summary, digits = 3)
+# Heuristic tail calculation: fitted means and selected subset treated as fixed.
+ppois(sum(y[low_risk]) - 1, lambda = sum(mu[low_risk]),
+      lower.tail = FALSE)
+```
+
+**Earlier finding:** among 244 observations with predicted count below 0.05, observed total was 9 versus expected 7.596. The conditional fixed-mean Poisson upper tail is approximately 0.351. This suggests reasonable *aggregate* mean calibration in this subset; it does not establish correct conditional variance.
+
+### 3.3 Simulate the Pearson statistic under the fitted model
+
+Instead of using the chi-square approximation, simulate datasets under the fitted Poisson model, refit the *same* model, and recompute the Pearson statistic. This is an assessment under the model's conditional-independence assumption; the county dependence/design issue is a separate question.
+
+```{r pearson-bootstrap}
+set.seed(123)
+B <- 1000
+X <- model.matrix(glm.1)
+offset_used <- model.offset(model.frame(glm.1))
+
+pearson_sim <- replicate(B, {
+  y_sim <- rpois(length(mu), lambda = mu)
+  refit <- glm.fit(x = X, y = y_sim, family = poisson(),
+                   offset = offset_used)
+  sum((y_sim - refit$fitted.values)^2 / refit$fitted.values)
+})
+
+p_boot <- (1 + sum(pearson_sim >= pearson_stat)) / (B + 1)
+cat("Simulation-based Pearson upper-tail p-value:", p_boot, "\n")
+hist(pearson_sim, breaks = 40,
+     main = "Simulated Pearson statistics",
+     xlab = "Pearson chi-square")
+abline(v = pearson_stat, col = "red", lwd = 2)
+```
+
+**Earlier result:** a 500-replicate version gave p ≈ 0.034. That is weaker evidence than the asymptotic p-value, but still suggests some lack of fit at the 5% level. The code above generates a new estimate using 1,000 replicates; use its displayed result in the discussion.
+
+## 4. Compare alternative count models
+
+The goal is to test whether the extra flexibility materially improves model fit, not simply to find a larger p-value.
+
+We fitted a negative binomial model to address potential overdispersion. However, the estimated dispersion parameter was approximately 926, indicating that the negative binomial variance was very close to the Poisson variance. Additionally, the negative binomial model had a slightly higher AIC (848.19 versus 846.18), suggesting that the additional dispersion parameter did not improve model f
+
+```{r alternative-models}
+library(MASS)
+library(pscl)
+library(lme4)
+
+# 1. Negative binomial
+nb_model <- glm.nb(
+  update(count_formula, . ~ . + offset(log(Population))),
+  data = model_data
+)
+
+# 2. Zero-inflated Poisson: constant zero probability
+zip.1 <- zeroinfl(
+  Crashes ~ Arm * Post + log_temp_f + log_pct_age_18_24 +
+    log_pct_age_65_plus + log_precipitation_mm +
+    log_wind_speed_kph + Storm_Week_x | 1,
+  offset = log(Population),
+  dist = "poisson",
+  link = "logit",
+  data = model_data
+)
+
+# 3. Zero-inflated Poisson: zero probability varies by arm and post
+zip.2 <- zeroinfl(
+  Crashes ~ Arm * Post + log_temp_f + log_pct_age_18_24 +
+    log_pct_age_65_plus + log_precipitation_mm +
+    log_wind_speed_kph + Storm_Week_x | Arm + Post,
+  offset = log(Population),
+  dist = "poisson",
+  link = "logit",
+  data = model_data
+)
+
+# 4. County-level random intercept
+glmer.county <- glmer(
+  Crashes ~ Arm * Post + log_temp_f + log_pct_age_18_24 +
+    log_pct_age_65_plus + log_precipitation_mm +
+    log_wind_speed_kph + Storm_Week_x + (1 | County),
+  offset = log(Population),
+  family = poisson,
+  data = model_data
+)
+
+# 5. Group-level random intercept (optional)
+models <- list(
+  Poisson = glm.1,
+  Negative_Binomial = nb_model,
+  ZIP_Intercept = zip.1,
+  ZIP_Covariates = zip.2,
+  Poisson_County_RE = glmer.county
+)
+
+if ("Group" %in% names(model_data)) {
+  glmer.group <- glmer(
+    Crashes ~ Arm * Post + log_temp_f + log_pct_age_18_24 +
+      log_pct_age_65_plus + log_precipitation_mm +
+      log_wind_speed_kph + Storm_Week_x + (1 | Group),
+    offset = log(Population),
+    family = poisson,
+    data = model_data
+  )
+
+  models$Poisson_Group_RE <- glmer.group
+}
+
+# 6. Compare all models by AIC
+
+# Check number of observations
+n_used <- sapply(models, function(m) length(residuals(m)))
+print(n_used)
+
+stopifnot(length(unique(n_used)) == 1)
+
+# Compare AIC
+fit_comparison <- data.frame(
+  Model = names(models),
+  AIC = sapply(models, AIC)
+)
+
+fit_comparison$Delta_AIC <-
+  fit_comparison$AIC - min(fit_comparison$AIC)
+
+knitr::kable(fit_comparison, digits = 3)
+
+# 7. Additional diagnostics
+cat("Negative binomial theta:", nb_model$theta, "\n")
+
+cat("\nZIP structural-zero probabilities:\n")
+print(summary(predict(zip.2, type = "zero")))
+
+cat("\nCounty random intercept variance:\n")
+print(as.data.frame(VarCorr(glmer.county))[, c("grp", "vcov", "sdcor")])
+
+cat("\nCounty model singular fit?:",
+    isSingular(glmer.county), "\n")
+```
+
+
+```{r alternative-models}
+
+```
+
+
+**Previously reported results** (these should match the new run if the model and data are unchanged):
+
+| Model | AIC | Interpretation |
+|:--|--:|:--|
+| Poisson GLM | **846.18** | Lowest AIC |
+| Negative binomial | 848.19 | Extra dispersion unnecessary for likelihood improvement; theta ≈ 926 |
+| ZIP, intercept-only zero part | 848.18 | Extra parameter without likelihood gain |
+| ZIP, arm + post zero part | 854.18 | No likelihood gain; structural-zero probabilities ~0 |
+| Poisson with county random intercept | 848.18 | Random-intercept variance estimated as 0; singular fit |
+| Poisson with 15-group random intercept | 848.18 | Random-intercept variance estimated as 0; singular fit |
+
+**Interpretation:** Multiple extensions effectively reduced to the simpler Poisson fit. This is positive support for Poisson *among the candidate models tested*, rather than a guarantee that no other model or dependence structure could matter.
+
+## 5. Implications for estimating campaign effects
+
+Poisson mean fit and treatment-effect uncertainty are **different questions**. Because counties are the randomization units and appear repeatedly, we compare model-based standard errors with standard errors clustered by county. This changes uncertainty estimates but not Poisson point estimates.
+
+```{r clustered-inference}
+county_cluster <- droplevels(model_data$County)
+V_cluster <- vcovCL(glm.1, cluster = county_cluster, type = "HC1")
+
+comparison <- data.frame(
+  Term = names(coef(glm.1)),
+  Estimate = unname(coef(glm.1)),
+  Original_SE = unname(summary(glm.1)$coefficients[, "Std. Error"]),
+  County_Clustered_SE = unname(sqrt(diag(V_cluster)))
+)
+knitr::kable(comparison, digits = 4)
+
+trt_terms <- c("ArmNighttime:Post1", "ArmSpeeding:Post1")
+beta <- coef(glm.1)[trt_terms]
+se <- sqrt(diag(V_cluster))[trt_terms]
+cluster_df <- nlevels(county_cluster) - 1
+p_t <- 2 * pt(-abs(beta / se), df = cluster_df)
+critical_t <- qt(0.975, df = cluster_df)
+
+trt_results <- data.frame(
+  Arm_Interaction = trt_terms,
+  Rate_Ratio = exp(beta),
+  CI_Lower = exp(beta - critical_t * se),
+  CI_Upper = exp(beta + critical_t * se),
+  Clustered_P = p_t,
+  Holm_Adjusted_P = p.adjust(p_t, method = "holm"),
+  row.names = NULL
+)
+knitr::kable(trt_results, digits = 3)
+```
+
+**Previous point estimates:** Nighttime rate-ratio-of-rate-ratios = 0.427 (95% county-clustered CI 0.214–0.851); Speeding = 0.589 (0.362–0.958). These are preliminary model-based comparisons of pre/post change relative to control, not yet validated causal claims.
+
+## 6. Discussion with Cathy: conclusion and remaining checks
+
+**Proposed conclusion:**
+
+> Across the distributional diagnostics and candidate models we tested, the ordinary Poisson specification is the most parsimonious working model for weekly fatal crashes. DHARMa did not detect substantial dispersion or excess-zero problems, and negative binomial, ZIP, and random-intercept extensions did not improve AIC. The exception is the Pearson statistic: its asymptotic chi-square test is strongly significant and a simulation-calibrated version still indicates some discrepancy. About one-third of the statistic comes from ten observations with very small expected crash counts, while the aggregate observed and expected counts in the lowest-risk subset are similar. We therefore favor Poisson provisionally, report the Pearson caveat transparently, and separate count-model selection from design-appropriate treatment-effect inference.
+
+**Questions to resolve before final inference:**
+
+- Confirm the assignment mechanism: Were 88 counties independently randomized, or were assignments restricted or stratified (potentially using `Group`)?
+- Investigate temporal dependence and possible spatial interference between counties; a zero random-intercept estimate does not prove independence.
+- Confirm the interpretation and timing of `Post` (`Week_Rel >= 2`) and examine pre-intervention patterns.
+- Consider randomization-based or small-sample cluster-aware inference, and prespecify how to handle two campaign contrasts.
+- Assess whether population is an appropriate exposure proxy versus a traffic-volume or vehicle-miles-traveled measure, if available.
+
+*Technical caveat:* AIC comparisons and distributional diagnostics assess the outcome model, not the validity of causal identification or of conventional GLM standard errors.
